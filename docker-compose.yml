@@ -1,18 +1,5 @@
 services:
-  # 1. Container Database (PostgreSQL)
-  db:
-    image: postgres:15-alpine
-    restart: always
-    environment:
-      POSTGRES_USER: okoce_user
-      POSTGRES_PASSWORD: okoce_password
-      POSTGRES_DB: okoce_db
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
 
-  # 2. Container Aplikasi (Flask)
   web:
     build: .
     restart: always
