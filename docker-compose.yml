@@ -29,5 +29,3 @@ services:
       - ./uploads:/app/uploads
       - ./firebase-service-account-key.json:/app/firebase-service-account-key.json
 
-volumes:
-  postgres_data:
