@@ -19,12 +19,14 @@ from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignat
 import string
 import firebase_admin
 from firebase_admin import credentials, messaging
+from flask_cors import CORS
 
 # --- KONFIGURASI APLIKASI ---
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 
 app = Flask(__name__)
+CORS(app)
 base_dir = os.path.abspath(os.path.dirname(__file__))
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///' + os.path.join(base_dir, 'instance', 'eventit.db'))
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -245,6 +247,7 @@ class User(db.Model, UserMixin):
     otp_expiry = db.Column(db.DateTime, nullable=True)
     last_otp_sent = db.Column(db.DateTime, nullable=True)
     fcm_token = db.Column(db.String(255), nullable=True, unique=True)
+    privacy_accepted_at = db.Column(db.DateTime, nullable=True)
 
     def set_password(self, password): self.password_hash = bcrypt.generate_password_hash(password).decode('utf8')
     def check_password(self, password): return bcrypt.check_password_hash(self.password_hash, password)
@@ -458,6 +461,60 @@ def send_password_reset_email(user_email, otp_code):
         print(f"Error sending email: {e}")
         return False
 
+@app.route('/api/public/events', methods=['GET'])
+def public_get_events():
+    """
+    Endpoint PUBLIK untuk mengambil daftar event aktif.
+    Support Pagination: ?page=1&limit=10
+    """
+    try:
+        # 1. Ambil parameter pagination
+        page = request.args.get('page', 1, type=int)
+        limit = request.args.get('limit', 10, type=int)
+        
+        now_utc = datetime.utcnow()
+        
+        query = Event.query.filter(
+            Event.jenis_event == 'Public', 
+            Event.is_archived == False,
+            Event.tgl_selesai_event > now_utc
+        ).order_by(Event.tgl_mulai_event.asc())
+        
+        pagination = query.paginate(page=page, per_page=limit, error_out=False)
+        events = pagination.items
+        
+        results = []
+        for e in events:
+            # Konversi waktu ke WIB untuk display
+            dt_aware_utc = pytz.utc.localize(e.tgl_mulai_event)
+            dt_aware_wib = dt_aware_utc.astimezone(LOCAL_TZ)
+            
+            results.append({
+                'id': e.id,
+                'title': e.title,
+                'description': e.description[:200] + "..." if len(e.description) > 200 else e.description,
+                'start_time': dt_aware_wib.isoformat(),
+                'location': e.tempat_event,
+                'price': e.price,
+                # Gunakan request.host_url agar domainnya dinamis mengikuti server
+                'image_url': f"{request.host_url}uploads/{e.image_filename}" if e.image_filename else None,
+                'registration_open': e.tgl_buka_pendaftaran <= now_utc <= e.tgl_tutup_pendaftaran
+            })
+            
+        return jsonify({
+            'status': 'success',
+            'data': results,
+            'meta': {
+                'current_page': page,
+                'per_page': limit,
+                'total_events': pagination.total,
+                'total_pages': pagination.pages
+            }
+        }), 200
+
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+    
 # --- API UNTUK APLIKASI MOBILE (FLUTTER) ---
 @app.route('/api/register', methods=['POST'])
 def api_register():
@@ -493,7 +550,8 @@ def api_register():
         is_verified=False, 
         verification_otp=otp, 
         otp_expiry=expiry_time, 
-        last_otp_sent=datetime.utcnow()
+        last_otp_sent=datetime.utcnow(),
+        privacy_accepted_at=datetime.utcnow()
     )
     new_user.set_password(data['password'])
     
@@ -1339,19 +1397,66 @@ def web_logout():
 @login_required
 @role_required(['admin'])
 def dashboard():
-    events = Event.query.filter_by(is_archived=False).order_by(
-        Event.tgl_mulai_event.asc() # Urutkan: event paling lama (ASC) di atas
-    ).all()
+    # 1. Ambil parameter dari URL (dengan nilai default)
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int) # Default 10 event per halaman
+    search = request.args.get('search', '')
+
+    # 2. Base Query (Belum dieksekusi)
+    query = Event.query.filter_by(is_archived=False)
+
+    # 3. Tambahkan Filter Pencarian (Jika ada input search)
+    if search:
+        # ilike = Case Insensitive search (besar/kecil huruf dianggap sama)
+        query = query.filter(Event.title.ilike(f'%{search}%'))
+
+    # 4. Urutkan dan Paginate
+    # Dashboard utama urut ASC (Terlama/Mendatang di atas)
+    pagination = query.order_by(Event.tgl_mulai_event.asc()).paginate(page=page, per_page=per_page, error_out=False)
     
-    for event in events: event.registered_count = Ticket.query.filter_by(event_id=event.id).count()
-    return render_template('dashboard.html', events=events)
+    events = pagination.items # Ambil data event dari halaman saat ini
+    
+    # Hitung jumlah pendaftar untuk event yang ditampilkan saja
+    for event in events: 
+        event.registered_count = Ticket.query.filter_by(event_id=event.id).count()
+
+    return render_template(
+        'dashboard.html', 
+        events=events, 
+        pagination=pagination, # Kirim objek pagination ke HTML
+        current_search=search,
+        current_per_page=per_page
+    )
 
 @app.route('/archive')
 @login_required
 @role_required(['admin'])
 def archived_events_list():
-    events = Event.query.filter_by(is_archived=True).order_by(Event.tgl_mulai_event.desc()).all()
-    return render_template('archive_list.html', events=events)
+    # 1. Ambil parameter
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    search = request.args.get('search', '')
+
+    # 2. Base Query
+    query = Event.query.filter_by(is_archived=True)
+
+    # 3. Filter Pencarian
+    if search:
+        query = query.filter(Event.title.ilike(f'%{search}%'))
+
+    # 4. Urutkan dan Paginate
+    # Arsip urut DESC (Terbaru di atas)
+    pagination = query.order_by(Event.tgl_mulai_event.desc()).paginate(page=page, per_page=per_page, error_out=False)
+    
+    events = pagination.items
+
+    return render_template(
+        'archive_list.html', 
+        events=events, 
+        pagination=pagination,
+        current_search=search,
+        current_per_page=per_page
+    )
 
 @app.route('/event/<int:event_id>/archive', methods=['POST'])
 @login_required
@@ -1371,6 +1476,49 @@ def unarchive_event(event_id):
     event.is_archived = False
     db.session.commit()
     flash(f"Event '{event.title}' telah dikembalikan.", "success")
+    return redirect(url_for('archived_events_list'))
+
+@app.route('/events/bulk-archive', methods=['POST'])
+@login_required
+@role_required(['admin'])
+def bulk_archive():
+    # Ambil list ID yang dikirim dari checkbox
+    event_ids = request.form.getlist('event_ids')
+    
+    if not event_ids:
+        flash('Tidak ada event yang dipilih.', 'warning')
+        return redirect(url_for('dashboard'))
+
+    # Update semua event yang ID-nya ada di list
+    # Event.id.in_(event_ids) adalah cara SQL "WHERE id IN (1, 2, 3)"
+    try:
+        Event.query.filter(Event.id.in_(event_ids)).update({Event.is_archived: True}, synchronize_session=False)
+        db.session.commit()
+        flash(f'{len(event_ids)} event berhasil diarsipkan.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        flash('Terjadi kesalahan saat mengarsipkan event.', 'danger')
+
+    return redirect(url_for('dashboard'))
+
+@app.route('/events/bulk-unarchive', methods=['POST'])
+@login_required
+@role_required(['admin'])
+def bulk_unarchive():
+    event_ids = request.form.getlist('event_ids')
+    
+    if not event_ids:
+        flash('Tidak ada event yang dipilih.', 'warning')
+        return redirect(url_for('archived_events_list'))
+
+    try:
+        Event.query.filter(Event.id.in_(event_ids)).update({Event.is_archived: False}, synchronize_session=False)
+        db.session.commit()
+        flash(f'{len(event_ids)} event berhasil dikembalikan.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        flash('Terjadi kesalahan saat mengembalikan event.', 'danger')
+
     return redirect(url_for('archived_events_list'))
 
 @app.route('/event/new', methods=['GET', 'POST'])
@@ -1700,6 +1848,66 @@ def serialize_business(business):
         'installment_start_date': funding.installment_start_date if funding else None,
         'duration_months': funding.duration_months if funding else None,
     }
+
+@app.route('/reports/download')
+@login_required
+@role_required(['admin'])
+def download_monthly_report():
+    # 1. Ambil Parameter Bulan & Tahun (Sama seperti route reports)
+    now = datetime.utcnow()
+    try:
+        selected_month = int(request.args.get('month', now.month))
+        selected_year = int(request.args.get('year', now.year))
+    except ValueError:
+        selected_month = now.month
+        selected_year = now.year
+
+    # 2. Filter Event sesuai Bulan & Tahun
+    events_in_month = Event.query.filter(
+        extract('year', Event.tgl_mulai_event) == selected_year,
+        extract('month', Event.tgl_mulai_event) == selected_month
+    ).order_by(Event.tgl_mulai_event.asc()).all()
+
+    # 3. Siapkan File CSV di Memori
+    si = io.StringIO()
+    writer = csv.writer(si)
+    
+    # Header CSV
+    writer.writerow(['No', 'Nama Event', 'Tanggal Mulai', 'Lokasi', 'Kuota', 'Terdaftar', 'Hadir (Check-in)', 'Persentase Kehadiran (%)'])
+
+    # 4. Loop Data dan Tulis ke CSV
+    for i, event in enumerate(events_in_month, 1):
+        reg_count = Ticket.query.filter_by(event_id=event.id).count()
+        check_count = Ticket.query.filter_by(event_id=event.id, is_checked_in=True).count()
+        rate = (check_count / reg_count) * 100 if reg_count > 0 else 0
+        
+        # Format Tanggal (WIB)
+        dt_aware_utc = pytz.utc.localize(event.tgl_mulai_event)
+        dt_aware_wib = dt_aware_utc.astimezone(LOCAL_TZ)
+        date_str = dt_aware_wib.strftime('%d-%m-%Y %H:%M')
+
+        writer.writerow([
+            i,
+            event.title,
+            date_str,
+            event.tempat_event,
+            event.slot_peserta,
+            reg_count,
+            check_count,
+            f"{rate:.1f}"
+        ])
+
+    # 5. Return sebagai File Download
+    output = si.getvalue()
+    si.close()
+    
+    filename = f"Laporan_Bulanan_{selected_month}_{selected_year}.csv"
+    
+    return Response(
+        output,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment;filename={filename}"}
+    )
 
 @app.route('/api/admin/user/<int:user_id>/details')
 @login_required
