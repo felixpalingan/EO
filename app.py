@@ -1849,6 +1849,24 @@ def serialize_business(business):
         'duration_months': funding.duration_months if funding else None,
     }
 
+@app.route('/api/public/download/apk', methods=['GET'])
+def public_download_apk():
+    """
+    Endpoint PUBLIK untuk mendownload APK terbaru.
+    """
+    try:
+        apk_directory = os.path.join(app.root_path, 'static', 'apk')
+        filename = 'OK OCE.apk'
+
+        return send_from_directory(
+            directory=apk_directory,
+            path=filename,
+            as_attachment=True, 
+            download_name='OKOCE.apk'
+        )
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': 'File APK belum tersedia di server.'}), 404
+    
 @app.route('/reports/download')
 @login_required
 @role_required(['admin'])
