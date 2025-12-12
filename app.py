@@ -1010,6 +1010,108 @@ def submit_test_api(event_id):
         'message': f'{test_type} Selesai! Nilai Anda: {final_score}'
     }), 200
 
+# ======================================================
+# --- KHUSUS API MOBILE PANITIA (SECURE) ---
+# ======================================================
+
+@app.route('/api/mobile/panitia/login', methods=['POST'])
+def mobile_panitia_login():
+    """
+    Login khusus Panitia. 
+    User biasa (role='user') akan DITOLAK (403 Forbidden).
+    """
+    data = request.json
+    login_identifier = data.get('login_identifier')
+    password = data.get('password')
+
+    if '@' in login_identifier:
+        user = User.query.filter_by(email=login_identifier).first()
+    else:
+        user = User.query.filter_by(phone_number=login_identifier).first()
+
+    if user and user.check_password(password):
+        # --- SECURITY CHECK POINT ---
+        # Hanya Admin & Panitia yang boleh lewat sini.
+        if user.role not in ['admin', 'panitia']:
+            return jsonify({
+                'status': 'error',
+                'message': 'Akses Ditolak. Akun Anda bukan Panitia.'
+            }), 403
+        
+        # Jika lolos, login secara resmi
+        login_user(user, remember=True)
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Login Panitia Berhasil',
+            'user': {
+                'id': user.id,
+                'name': user.name,
+                'role': user.role
+            }
+        }), 200
+    
+    return jsonify({'status': 'error', 'message': 'Email/Password Salah'}), 401
+
+@app.route('/api/mobile/panitia/scan', methods=['POST'])
+@login_required
+@role_required(['admin', 'panitia']) # Double Protection
+def mobile_panitia_scan():
+    """
+    Endpoint scan tiket khusus Mobile App.
+    Mengembalikan data lengkap untuk UI (mirip Web Scanner).
+    """
+    data = request.json
+    ticket_code = data.get('ticket_code')
+    
+    if not ticket_code:
+        return jsonify({'status': 'error', 'message': 'Kode tiket tidak terbaca'}), 400
+        
+    ticket = Ticket.query.filter_by(ticket_code=ticket_code).first()
+    
+    # 1. Validasi Tiket Ada
+    if not ticket:
+        return jsonify({'status': 'error', 'message': 'Tiket Tidak Valid / Tidak Ditemukan'}), 404
+        
+    # 2. Cek Sudah Check-in?
+    if ticket.is_checked_in:
+        # Ambil info siapa yang check-in sebelumnya (jika ada log)
+        checker_name = "Panitia Sebelumnya"
+        check_in_data = CheckIn.query.filter_by(ticket_id=ticket.id).first()
+        time_str = check_in_data.timestamp.strftime('%H:%M') if check_in_data else "-"
+        
+        return jsonify({
+            'status': 'error', # Dianggap error karena sudah kepakai
+            'message': f'Tiket SUDAH DIGUNAKAN pukul {time_str}',
+            'detail': {
+                'user_name': ticket.user.name,
+                'event_title': ticket.event.title
+            }
+        }), 409
+    
+    # 3. Proses Check-in
+    try:
+        ticket.is_checked_in = True
+        new_check_in = CheckIn(ticket_id=ticket.id, timestamp=datetime.utcnow())
+        db.session.add(new_check_in)
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Check-in BERHASIL',
+            'detail': {
+                'user_name': ticket.user.name, 
+                'user_email': ticket.user.email,
+                'event_title': ticket.event.title,
+                'ticket_type': 'Reguler', # Bisa disesuaikan nanti
+                'check_in_time': datetime.now(LOCAL_TZ).strftime('%H:%M WIB')
+            }
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': f'Server Error: {str(e)}'}), 500
+    
 @app.route('/api/checkin', methods=['POST'])
 @login_required
 def check_in():
@@ -1037,22 +1139,17 @@ def check_in():
     if not user or not event:
         return jsonify({'status': 'error', 'message': 'Data user/event tidak ditemukan'}), 500
     
-    # 1. Panitia atau Admin (Alur Scanner Offline)
     if current_user.role in ['admin', 'panitia']:
-        pass # Lanjutkan ke proses check-in
-
+        pass 
+    
     elif current_user.role == 'user':
-        # User HANYA boleh check-in jika:
         
-        # A. Dia adalah pemilik tiketnya
         if ticket.user_id != current_user.id:
             return jsonify({'status': 'error', 'message': 'Akses Ditolak: Anda bukan pemilik tiket ini'}), 403
         
-        # B. Event-nya adalah 'Online'
         if event.tempat_event != 'Online':
             return jsonify({'status': 'error', 'message': 'Akses Ditolak: Tiket ini harus di-scan oleh panitia'}), 403
         
-        # (Opsional: Tambahkan cek waktu)
         now = datetime.utcnow()
         if now < event.tgl_mulai_event:
             return jsonify({'status': 'error', 'message': 'Event belum dimulai'}), 400
@@ -1060,7 +1157,6 @@ def check_in():
         pass
 
     else:
-        # Role lain (jika ada) tidak diizinkan
         return jsonify({'status': 'error', 'message': 'Akses Ditolak'}), 403
 
     ticket.is_checked_in = True
